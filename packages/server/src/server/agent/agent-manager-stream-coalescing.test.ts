@@ -1406,3 +1406,40 @@ describe("target coalesced behavior", () => {
     }
   });
 });
+
+describe("a subscriber that throws during a timer flush", () => {
+  test("does not escape the timer and still delivers the rest of the batch", async () => {
+    vi.useFakeTimers();
+    const harness = createHarness();
+    try {
+      const { agentId, session } = await createManagedSession(harness);
+      harness.manager.subscribe(
+        (event) => {
+          if (
+            event.type === "agent_stream" &&
+            event.event.type === "timeline" &&
+            event.event.item.type === "assistant_message" &&
+            event.event.item.text === "boom"
+          ) {
+            throw new Error("subscriber failed");
+          }
+        },
+        { replayState: false },
+      );
+
+      session.pushEvent(assistant("lead"));
+      session.pushEvent(assistant("boom"));
+      session.pushEvent(timelineEvent(toolCall({ output: "after" })));
+      await waitForSessionEventQueue();
+
+      await vi.advanceTimersByTimeAsync(COALESCE_WINDOW_MS);
+
+      expect(getTimelineItems(await harness.manager.getTimelineRows(agentId))).toEqual([
+        { type: "assistant_message", text: "leadboom" },
+        toolCall({ output: "after" }),
+      ]);
+    } finally {
+      harness.cleanup();
+    }
+  });
+});

@@ -806,3 +806,111 @@ describe("AgentStreamCoalescer", () => {
     ]);
   });
 });
+
+function createThrowingHarness(options?: { onFlushError?: boolean }) {
+  const delivered: AgentStreamCoalescerFlush[] = [];
+  const reported: Array<{ error: unknown; agentId: string }> = [];
+  const failure = new Error("subscriber failed");
+  let failNext = false;
+  const coalescer = new AgentStreamCoalescer({
+    timers: { setTimeout, clearTimeout },
+    onFlush: (payload) => {
+      if (failNext) {
+        failNext = false;
+        throw failure;
+      }
+      delivered.push(payload);
+    },
+    ...(options?.onFlushError === false
+      ? {}
+      : {
+          onFlushError: (error: unknown, agentId: string) => {
+            reported.push({ error, agentId });
+          },
+        }),
+  });
+  return {
+    coalescer,
+    delivered,
+    reported,
+    failure,
+    failNextFlush: () => {
+      failNext = true;
+    },
+  };
+}
+
+describe("AgentStreamCoalescer when onFlush throws", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test("still delivers the rest of the batch, then rethrows to a synchronous caller", () => {
+    const { coalescer, delivered, failure, failNextFlush } = createThrowingHarness();
+    primeLeadingEdge(coalescer, delivered);
+
+    coalescer.handle("agent-1", assistant("a"));
+    coalescer.handle("agent-1", toolCall({ output: "running" }));
+    coalescer.handle("agent-1", assistant("b"));
+    failNextFlush();
+
+    expect(() => coalescer.flushFor("agent-1")).toThrow(failure);
+    expect(delivered.map((flush) => flush.item.type)).toEqual(["tool_call", "assistant_message"]);
+  });
+
+  test("a timer-driven flush reports the error instead of throwing out of the timer", async () => {
+    const { coalescer, delivered, reported, failure, failNextFlush } = createThrowingHarness();
+    primeLeadingEdge(coalescer, delivered);
+
+    coalescer.handle("agent-1", assistant("a"));
+    coalescer.handle("agent-1", toolCall({ output: "running" }));
+    failNextFlush();
+
+    await vi.advanceTimersByTimeAsync(60);
+    expect(reported).toEqual([{ error: failure, agentId: "agent-1" }]);
+    expect(delivered.map((flush) => flush.item.type)).toEqual(["tool_call"]);
+  });
+
+  test("flushAll flushes every other agent before rethrowing", () => {
+    const { coalescer, delivered, failure, failNextFlush } = createThrowingHarness();
+
+    coalescer.handle("agent-1", toolCall({ status: "running" }));
+    coalescer.handle("agent-2", toolCall({ status: "running" }));
+    delivered.length = 0;
+    coalescer.handle("agent-1", assistant("one"));
+    coalescer.handle("agent-2", assistant("two"));
+    failNextFlush();
+
+    expect(() => coalescer.flushAll()).toThrow(failure);
+    expect(delivered).toEqual([
+      {
+        agentId: "agent-2",
+        item: { type: "assistant_message", text: "two" },
+        provider: "codex",
+      },
+    ]);
+  });
+
+  test("flushAndDiscard still drops the buffer and its timer", async () => {
+    const { coalescer, delivered, failure, failNextFlush } = createThrowingHarness({
+      onFlushError: false,
+    });
+    primeLeadingEdge(coalescer, delivered);
+
+    coalescer.handle("agent-1", assistant("a"));
+    failNextFlush();
+    expect(() => coalescer.flushAndDiscard("agent-1")).toThrow(failure);
+
+    // A fresh buffer for the same id leads again instead of joining a stale window.
+    coalescer.handle("agent-1", assistant("after"));
+    expect(delivered.map((flush) => flush.item)).toEqual([
+      { type: "assistant_message", text: "after" },
+    ]);
+    await vi.advanceTimersByTimeAsync(60);
+    expect(delivered).toHaveLength(1);
+  });
+});

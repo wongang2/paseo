@@ -918,6 +918,10 @@ export class AgentManager {
         const event = this.recordAndDispatchTimelineItem(agentId, item, provider, turnId);
         this.notifyForegroundTurnWaiters(agentId, event);
       },
+      // A timer flush has no caller; an escaping subscriber error would crash the daemon.
+      onFlushError: (error, agentId) => {
+        this.logger.error({ err: error, agentId }, "Failed to deliver coalesced agent stream");
+      },
     });
     this.updateProviderRegistry({
       providerDefinitions: options.providerDefinitions ?? {},
@@ -5899,7 +5903,12 @@ export class AgentManager {
   }
 
   private async flushTasks(options: { includeAgentRegistrations: boolean }): Promise<void> {
-    this.agentStreamCoalescer.flushAll();
+    try {
+      this.agentStreamCoalescer.flushAll();
+    } catch (error) {
+      // A failed stream delivery must not skip draining persistence below.
+      this.logger.error({ err: error }, "Failed to deliver coalesced agent stream");
+    }
     // Drain tasks, including tasks spawned while awaiting.
     while (
       this.backgroundTasks.size > 0 ||

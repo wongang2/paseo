@@ -28,6 +28,11 @@ export interface AgentStreamCoalescerOptions {
   timers: AgentStreamCoalescerTimers;
   now?: () => number;
   onFlush: (payload: AgentStreamCoalescerFlush) => void;
+  /**
+   * Receives an onFlush failure from a timer-driven flush, which has no caller to throw to.
+   * Without it the failure escapes the timer callback.
+   */
+  onFlushError?: (error: unknown, agentId: string) => void;
 }
 
 interface PendingTextEntry {
@@ -89,6 +94,7 @@ function isSameTextStream(previous: PendingTextEntry, next: PendingTextEntry): b
 export class AgentStreamCoalescer {
   private readonly buffers = new Map<string, PendingAgentStreamBuffer>();
   private readonly onFlush: (payload: AgentStreamCoalescerFlush) => void;
+  private readonly onFlushError: ((error: unknown, agentId: string) => void) | undefined;
   private readonly timers: AgentStreamCoalescerTimers;
   private readonly windowMs: number;
   private readonly now: () => number;
@@ -98,6 +104,7 @@ export class AgentStreamCoalescer {
     this.timers = options.timers;
     this.now = options.now ?? Date.now;
     this.onFlush = options.onFlush;
+    this.onFlushError = options.onFlushError;
   }
 
   handle(agentId: string, event: AgentStreamEvent): boolean {
@@ -138,18 +145,30 @@ export class AgentStreamCoalescer {
     this.flushBuffer(agentId);
   }
 
+  // One agent's failing delivery must not hold back every other agent's pending output.
   flushAll(): void {
+    let failure: { error: unknown } | null = null;
     for (const agentId of Array.from(this.buffers.keys())) {
-      this.flushBuffer(agentId);
+      try {
+        this.flushBuffer(agentId);
+      } catch (error) {
+        failure ??= { error };
+      }
+    }
+    if (failure) {
+      throw failure.error;
     }
   }
 
   flushAndDiscard(agentId: string): void {
-    this.flushBuffer(agentId);
-    const buffer = this.buffers.get(agentId);
-    if (buffer) {
-      this.clearTimer(buffer);
-      this.buffers.delete(agentId);
+    try {
+      this.flushBuffer(agentId);
+    } finally {
+      const buffer = this.buffers.get(agentId);
+      if (buffer) {
+        this.clearTimer(buffer);
+        this.buffers.delete(agentId);
+      }
     }
   }
 
@@ -209,7 +228,14 @@ export class AgentStreamCoalescer {
 
   private scheduleFlush(buffer: PendingAgentStreamBuffer): void {
     const timer = this.timers.setTimeout(() => {
-      this.flushBuffer(buffer.agentId, buffer);
+      try {
+        this.flushBuffer(buffer.agentId, buffer);
+      } catch (error) {
+        if (!this.onFlushError) {
+          throw error;
+        }
+        this.onFlushError(error, buffer.agentId);
+      }
     }, this.windowMs);
     timer.unref?.();
     buffer.timer = timer;
@@ -246,8 +272,10 @@ export class AgentStreamCoalescer {
     buffer.flushing = true;
     buffer.lastFlushAt = this.now();
 
-    try {
-      for (const entry of this.collapseEntries(entries)) {
+    // The entries already left the buffer, so a failed delivery must not cost the ones after it.
+    let failure: { error: unknown } | null = null;
+    for (const entry of this.collapseEntries(entries)) {
+      try {
         this.onFlush({
           agentId,
           item:
@@ -260,9 +288,13 @@ export class AgentStreamCoalescer {
           provider: entry.provider,
           ...(entry.turnId !== undefined ? { turnId: entry.turnId } : {}),
         });
+      } catch (error) {
+        failure ??= { error };
       }
-    } finally {
-      buffer.flushing = false;
+    }
+    buffer.flushing = false;
+    if (failure) {
+      throw failure.error;
     }
   }
 
