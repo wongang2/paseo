@@ -57,6 +57,7 @@ const mockState = vi.hoisted(() => {
     runtimeModels: new Map<string, AgentModelDefinition[]>(),
     cursorListFeaturesConfigs: [] as AgentSessionConfig[],
     codexNativeArchiveCalls: [] as Array<{ state: "archive" | "restore"; handle: unknown }>,
+    codexDeps: [] as unknown[],
     reset() {
       this.constructorArgs.claude = [];
       this.constructorArgs.codex = [];
@@ -71,6 +72,7 @@ const mockState = vi.hoisted(() => {
       this.runtimeModels.clear();
       this.cursorListFeaturesConfigs = [];
       this.codexNativeArchiveCalls = [];
+      this.codexDeps = [];
     },
   };
 });
@@ -149,9 +151,10 @@ vi.mock("./providers/codex-app-server-agent.js", () => ({
     readonly provider = "codex";
     readonly runtimeSettings?: unknown;
 
-    constructor(_logger: unknown, runtimeSettings?: unknown) {
+    constructor(_logger: unknown, runtimeSettings?: unknown, deps?: unknown) {
       this.runtimeSettings = runtimeSettings;
       mockState.constructorArgs.codex.push({ runtimeSettings });
+      mockState.codexDeps.push(deps);
     }
 
     async createSession(): Promise<never> {
@@ -643,6 +646,33 @@ test("new provider extending codex archives and unarchives its native sessions",
     { state: "archive", handle: { ...handle, provider: "codex" } },
     { state: "restore", handle: { ...handle, provider: "codex" } },
   ]);
+});
+
+test("a provider extending codex gets the same workspace git service as the built-in", () => {
+  const workspaceGitService = { resolveRepoRoot: async (cwd: string) => cwd };
+  const registry = buildProviderRegistry(logger, {
+    workspaceGitService: workspaceGitService as never,
+    providerOverrides: { "my-codex": { extends: "codex", label: "My Codex" } },
+  });
+
+  registry.codex.createClient(logger);
+  registry["my-codex"].createClient(logger);
+
+  expect(mockState.codexDeps.at(-2)).toMatchObject({ workspaceGitService });
+  expect(mockState.codexDeps.at(-1)).toMatchObject({ workspaceGitService });
+});
+
+test("a provider extending omp launches through the injected OMP runtime", async () => {
+  const omp = new FakeOmp();
+  const registry = buildProviderRegistry(logger, {
+    ompRuntime: omp,
+    providerOverrides: { "my-omp": { extends: "omp", label: "My OMP" } },
+  });
+
+  const client = registry["my-omp"].createClient(logger);
+  const session = await client.createSession({ provider: "my-omp", cwd: "/tmp/registry-my-omp" });
+  expect(omp.recordedLaunches).toEqual([expect.objectContaining({ cwd: "/tmp/registry-my-omp" })]);
+  await session.close();
 });
 
 test("built-in OMP override keeps the real OMP adapter enabled and launchable", async () => {

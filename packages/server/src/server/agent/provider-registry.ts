@@ -813,7 +813,10 @@ function buildResolvedBuiltinProviders(
 function addDerivedProviders(
   resolvedProviders: Map<string, ResolvedProvider>,
   providerOverrides: Record<string, ProviderOverride>,
-  options: Pick<BuildProviderRegistryOptions, "managedProcesses" | "openCodeBridge">,
+  options: Pick<
+    BuildProviderRegistryOptions,
+    "workspaceGitService" | "managedProcesses" | "ompRuntime" | "openCodeBridge"
+  >,
 ): void {
   for (const [providerId, override] of Object.entries(providerOverrides)) {
     if (resolvedProviders.has(providerId) || BUILTIN_PROVIDER_IDS.includes(providerId)) {
@@ -907,8 +910,11 @@ function addDerivedProviders(
       derivedFromProviderId: baseProviderId,
       providerOptions,
       createBaseClient: (logger) =>
+        // Same dependencies as the built-in it extends, so a derived client cannot drift from it.
         baseFactory(logger, mergedRuntimeSettings, {
+          workspaceGitService: options.workspaceGitService,
           managedProcesses: options.managedProcesses,
+          ompRuntime: options.ompRuntime,
           openCodeBridge: options.openCodeBridge,
           customProvider: {
             id: providerId,
@@ -927,15 +933,17 @@ export function buildProviderRegistry(
 ): Record<AgentProvider, ProviderDefinition> {
   const runtimeSettings = options?.runtimeSettings;
   const providerOverrides = options?.providerOverrides ?? {};
+  // Built-ins and the custom providers that extend them share one dependency set.
+  const clientDependencies = {
+    workspaceGitService: options?.workspaceGitService,
+    managedProcesses: options?.managedProcesses,
+    ompRuntime: options?.ompRuntime,
+    openCodeBridge: options?.openCodeBridge,
+  };
   const resolvedProviders = buildResolvedBuiltinProviders(
     providerOverrides,
     runtimeSettings,
-    {
-      workspaceGitService: options?.workspaceGitService,
-      managedProcesses: options?.managedProcesses,
-      ompRuntime: options?.ompRuntime,
-      openCodeBridge: options?.openCodeBridge,
-    },
+    clientDependencies,
     options?.isDev === true,
   );
   for (const [provider, definition] of Object.entries(options?.pluginProviders ?? {})) {
@@ -962,10 +970,7 @@ export function buildProviderRegistry(
       }),
     );
   }
-  addDerivedProviders(resolvedProviders, providerOverrides, {
-    managedProcesses: options?.managedProcesses,
-    openCodeBridge: options?.openCodeBridge,
-  });
+  addDerivedProviders(resolvedProviders, providerOverrides, clientDependencies);
 
   return Object.fromEntries(
     [...resolvedProviders.entries()].map(([provider, resolved]) => [
